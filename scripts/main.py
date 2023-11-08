@@ -2,9 +2,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 import uuid
-from lcm.lcm_scheduler import LCMScheduler
-from lcm.lcm_pipeline import LatentConsistencyModelPipeline
-from lcm.lcm_i2i_pipeline import LatentConsistencyModelImg2ImgPipeline
+#from lcm.lcm_scheduler import LCMScheduler
+from diffusers.schedulers.scheduling_lcm import LCMScheduler
+from diffusers import LatentConsistencyModelPipeline
+from diffusers import LatentConsistencyModelImg2ImgPipeline
 from diffusers.image_processor import PipelineImageInput
 import modules.scripts as scripts
 import modules.shared
