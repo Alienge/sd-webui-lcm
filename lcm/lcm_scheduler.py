@@ -192,6 +192,7 @@ class LCMScheduler(SchedulerMixin, ConfigMixin):
         beta_end: float = 0.02,
         beta_schedule: str = "linear",
         trained_betas: Optional[Union[np.ndarray, List[float]]] = None,
+        original_inference_steps: int = 50,
         clip_sample: bool = True,
         set_alpha_to_one: bool = True,
         steps_offset: int = 0,
@@ -201,6 +202,7 @@ class LCMScheduler(SchedulerMixin, ConfigMixin):
         clip_sample_range: float = 1.0,
         sample_max_value: float = 1.0,
         timestep_spacing: str = "leading",
+        timestep_scaling: float = 10.0,
         rescale_betas_zero_snr: bool = False,
     ):
         if trained_betas is not None:
@@ -240,8 +242,25 @@ class LCMScheduler(SchedulerMixin, ConfigMixin):
 
         # setable values
         self.num_inference_steps = None
-        self.timesteps = torch.from_numpy(np.arange(0, num_train_timesteps)[
-                                          ::-1].copy().astype(np.int64))
+        self.timesteps = torch.from_numpy(np.arange(0, num_train_timesteps)[::-1].copy().astype(np.int64))
+        self._step_index = None
+
+     def _init_step_index(self, timestep):
+        if isinstance(timestep, torch.Tensor):
+            timestep = timestep.to(self.timesteps.device)
+
+        index_candidates = (self.timesteps == timestep).nonzero()
+
+        # The sigma index that is taken for the **very** first `step`
+        # is always the second index (or the last index if there is only 1)
+        # This way we can ensure we don't accidentally skip a sigma in
+        # case we start in the middle of the denoising schedule (e.g. for image-to-image)
+        if len(index_candidates) > 1:
+            step_index = index_candidates[1]
+        else:
+            step_index = index_candidates[0]
+
+        self._step_index = step_index.item()
 
     def scale_model_input(self, sample: torch.FloatTensor, timestep: Optional[int] = None) -> torch.FloatTensor:
         """
@@ -259,6 +278,10 @@ class LCMScheduler(SchedulerMixin, ConfigMixin):
                 A scaled input sample.
         """
         return sample
+
+    @property
+    def step_index(self):
+        return self._step_index
 
     def _get_variance(self, timestep, prev_timestep):
         alpha_prod_t = self.alphas_cumprod[timestep]
@@ -310,7 +333,7 @@ class LCMScheduler(SchedulerMixin, ConfigMixin):
 
         return sample
 
-    def set_timesteps(self, num_inference_steps: int, original_inference_steps: int, device: Union[str, torch.device] = None):
+    def set_timesteps(self, num_inference_steps: int, original_inference_steps: int,strength: int = 1.0, device: Union[str, torch.device] = None):
         """
         Sets the discrete timesteps used for the diffusion chain (to be run before inference).
 
@@ -318,35 +341,52 @@ class LCMScheduler(SchedulerMixin, ConfigMixin):
             num_inference_steps (`int`):
                 The number of diffusion steps used when generating samples with a pre-trained model.
         """
-
+        
         if num_inference_steps > self.config.num_train_timesteps:
             raise ValueError(
                 f"`num_inference_steps`: {num_inference_steps} cannot be larger than `self.config.train_timesteps`:"
                 f" {self.config.num_train_timesteps} as the unet model trained with this scheduler can only handle"
                 f" maximal {self.config.num_train_timesteps} timesteps."
             )
-
         self.num_inference_steps = num_inference_steps
+        original_steps = (
+            original_inference_steps if original_inference_steps is not None else self.config.original_inference_steps
+        )
+
+        if original_steps > self.config.num_train_timesteps:
+            raise ValueError(
+                f"`original_steps`: {original_steps} cannot be larger than `self.config.train_timesteps`:"
+                f" {self.config.num_train_timesteps} as the unet model trained with this scheduler can only handle"
+                f" maximal {self.config.num_train_timesteps} timesteps."
+            )
+            
+        if num_inference_steps > original_steps:
+            raise ValueError(
+                f"`num_inference_steps`: {num_inference_steps} cannot be larger than `original_inference_steps`:"
+                f" {original_steps} because the final timestep schedule will be a subset of the"
+                f" `original_inference_steps`-sized initial timestep schedule."
+            )
+
+        
 
         # LCM Timesteps Setting:  # Linear Spacing
-        c = self.config.num_train_timesteps // original_inference_steps
-        lcm_origin_timesteps = np.asarray(
-            list(range(1, original_inference_steps + 1))) * c - 1   # LCM Training  Steps Schedule
+        c = self.config.num_train_timesteps // original_steps
+        lcm_origin_timesteps = np.asarray(list(range(1, int(original_steps * strength) + 1))) * c - 1
         skipping_step = len(lcm_origin_timesteps) // num_inference_steps
         # LCM Inference Steps Schedule
         timesteps = lcm_origin_timesteps[::-
                                          skipping_step][:num_inference_steps]
 
         self.timesteps = torch.from_numpy(timesteps.copy()).to(device)
+        self._step_index = None
 
     def get_scalings_for_boundary_condition_discrete(self, t):
         self.sigma_data = 0.5       # Default: 0.5
+        scaled_timestep = t * self.config.timestep_scaling
 
         # By dividing 0.1: This is almost a delta function at t=0.
-        c_skip = self.sigma_data**2 / (
-            (t / 0.1) ** 2 + self.sigma_data**2
-        )
-        c_out = ((t / 0.1) / ((t / 0.1) ** 2 + self.sigma_data**2) ** 0.5)
+        c_skip = self.sigma_data**2 / (scaled_timestep**2 + self.sigma_data**2)
+        c_out = scaled_timestep / (scaled_timestep**2 + self.sigma_data**2) ** 0.5
         return c_skip, c_out
 
     def step(
